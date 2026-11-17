@@ -32,7 +32,7 @@ def set_config(c):
     c.mse_avg = False
     c.mse_sum = True
     c.emd = False
-    c.l1 = True
+    c.l1_activation_penalty = False
     c.activation_extraction = True
     c.deterministic_algorithm = False
     c.type_list = [

@@ -28,6 +28,30 @@ from ..modules import utils
 from torch.nn import functional as F
 
 
+def l1_enabled(config, model):
+    """Whether training adds the L1 penalty on hidden activations.
+
+    Opt-in with config.l1_activation_penalty = True (default False); its weight
+    is config.reg_param. The older config.l1 flag has had no effect since the
+    penalty was disabled in fit() in March 2023 (e2cbaf8); it stays ignored, with
+    a note, so existing configs keep training exactly as before.
+    """
+    enabled = bool(getattr(config, "l1_activation_penalty", False))
+    if getattr(config, "l1", False) and not hasattr(config, "l1_activation_penalty"):
+        print(
+            "NOTE: config.l1 is ignored (no effect since 2023). To train with the "
+            "L1 penalty on hidden activations, set config.l1_activation_penalty = True."
+        )
+    if enabled and not hasattr(model, "forward_with_activations"):
+        print(
+            f"WARNING: config.l1_activation_penalty is True but "
+            f"{type(model).__name__} has no forward_with_activations(); "
+            "training without the L1 penalty."
+        )
+        enabled = False
+    return enabled
+
+
 def fit(
     config,
     model,
@@ -50,8 +74,8 @@ def fit(
         RHO (float): Float used for KL Divergence (Not currently a feature)
         l1 (boolean): If `True`, add regular_param times the L1 penalty on the
             model's hidden activations (utils.l1_activation_penalty on the output of
-            model.forward_with_activations) to the reconstruction loss. train()
-            switches it off, with a warning, for models without that method.
+            model.forward_with_activations) to the reconstruction loss. Set from
+            config.l1_activation_penalty by train(); see l1_enabled().
         n_dimensions (int): Number of dimensions.
     Returns:
         float, float, float, model object: per-epoch averages of the training
@@ -197,7 +221,7 @@ def train(model, variables, train_data, test_data, project_path, config):
     bs = config.batch_size
     reg_param = config.reg_param
     rho = config.RHO
-    l1 = config.l1
+    l1 = l1_enabled(config, model)
     epochs = config.epochs
     latent_space_size = config.latent_space_size
     intermittent_model_saving = config.intermittent_model_saving
@@ -295,13 +319,6 @@ def train(model, variables, train_data, test_data, project_path, config):
         lr_scheduler = utils.LRScheduler(
             optimizer=optimizer, patience=config.lr_scheduler_patience
         )
-
-    if l1 and not hasattr(model, "forward_with_activations"):
-        print(
-            f"WARNING: config.l1 is True but {type(model).__name__} has no "
-            "forward_with_activations(); training without the L1 penalty."
-        )
-        l1 = False
 
     # Training and Validation of the model
     train_loss = []

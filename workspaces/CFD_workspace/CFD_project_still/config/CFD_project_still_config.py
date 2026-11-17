@@ -12,7 +12,7 @@ def set_config(c):
     c.model_name = "Conv_AE"
     c.model_type = "convolutional"
     c.custom_norm = True
-    c.l1 = True
+    c.l1_activation_penalty = False
     c.reg_param = 0.001
     c.RHO = 0.05
     c.lr = 0.001

@@ -15,7 +15,7 @@ def set_config(c):
     c.model_name = "CFD_dense_AE"
     c.model_type = "dense"
     c.custom_norm = False
-    c.l1 = True
+    c.l1_activation_penalty = False
     c.reg_param = 0.001
     c.RHO = 0.05
     c.lr = 0.001

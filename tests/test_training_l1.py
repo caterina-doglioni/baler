@@ -104,6 +104,46 @@ def test_l1_penalty_reaches_the_gradients():
 
 
 def test_models_without_support_have_no_method():
-    """train() switches L1 off with a warning for these (e.g. the bundled
-    CFD_project_still config uses Conv_AE with l1 = True)."""
+    """l1_enabled() switches L1 off with a warning for these (e.g. the bundled
+    CFD_project_still config uses Conv_AE)."""
     assert not hasattr(models.Conv_AE, "forward_with_activations")
+
+
+def cfg(**kw):
+    return types.SimpleNamespace(**kw)
+
+
+def test_l1_off_by_default(capsys):
+    assert training.l1_enabled(cfg(), models.AE(N_FEATURES, Z_DIM)) is False
+    assert capsys.readouterr().out == ""
+
+
+def test_l1_on_with_flag():
+    c = cfg(l1_activation_penalty=True)
+    assert training.l1_enabled(c, models.AE(N_FEATURES, Z_DIM)) is True
+
+
+def test_old_l1_flag_is_ignored_with_note(capsys):
+    assert training.l1_enabled(cfg(l1=True), models.AE(N_FEATURES, Z_DIM)) is False
+    assert "l1_activation_penalty" in capsys.readouterr().out
+
+
+def test_old_l1_flag_no_note_when_new_flag_set(capsys):
+    c = cfg(l1=True, l1_activation_penalty=False)
+    assert training.l1_enabled(c, models.AE(N_FEATURES, Z_DIM)) is False
+    assert capsys.readouterr().out == ""
+
+
+def test_l1_flag_on_unsupported_model_warns_and_disables(capsys):
+    c = cfg(l1_activation_penalty=True)
+    model = models.Conv_AE(n_features=N_FEATURES, z_dim=Z_DIM)
+    assert training.l1_enabled(c, model) is False
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_template_has_flag_off():
+    from baler.modules import helper
+
+    text = helper.create_default_config("ws", "proj")
+    assert "c.l1_activation_penalty        = False" in text
+    assert "c.l1 " not in text

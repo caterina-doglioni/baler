@@ -162,7 +162,7 @@ class Config:
     model_name: str
     model_type = str
     custom_norm: bool
-    l1: bool
+    l1_activation_penalty: bool
     reg_param: float
     RHO: float
     lr: float
@@ -175,7 +175,6 @@ class Config:
     mse_avg: bool
     mse_sum: bool
     emd: bool
-    l1: bool
     deterministic_algorithm: bool
 
 
@@ -224,7 +223,7 @@ def set_config(c):
     c.mse_avg                      = False
     c.mse_sum                      = True
     c.emd                          = False
-    c.l1                           = True
+    c.l1_activation_penalty        = False  # L1 on hidden activations, weight reg_param
     c.activation_extraction        = False
     c.deterministic_algorithm      = True
     c.separate_model_saving        = False
