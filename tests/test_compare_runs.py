@@ -188,3 +188,14 @@ def test_plot_with_zero_heavy_variable(tmp_path):
     out = tmp_path / "p.png"
     cr.plot(head, base, res, str(out))
     assert out.stat().st_size > 0
+
+
+def test_loss_uses_reconstruction_part_when_present(tmp_path):
+    r = synthetic_runs(1)[0]
+    path = write_metrics(tmp_path / "m.json", r)
+    m = json.loads(open(path).read())
+    m["final_train_loss"] = 1.0  # total incl. an L1 term
+    m["final_reconstruction_loss"] = 0.003
+    with open(path, "w") as f:
+        json.dump(m, f)
+    assert cr.load_run(path)[cr.LOSS] == 0.003

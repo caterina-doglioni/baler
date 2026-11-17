@@ -20,6 +20,11 @@ Output file layouts this script relies on (from baler at ec4b178):
     per-epoch training loss, row 1 the validation loss (when config.test_size == 0
     baler copies the training loss into row 1). n_epochs_run can be < config.epochs
     if early stopping triggers.
+  - output/training/loss_components.npy (when present): shape (2, n_epochs_run),
+    row 0 the reconstruction part of the training loss, row 1 the regularization
+    part (weighted L1 and/or the SWAE term). The final-loss check uses row 0, so runs with and without L1 are held
+    to the same quantity. Without the file (older baler), the training loss is
+    used, which had no L1 part.
   - output/compressed_output/compressed.npz: keys data (n_rows, latent),
     names, normalization_features.
   - output/decompressed_output/decompressed.npz: keys data (n_rows, n_cols), names.
@@ -96,9 +101,16 @@ def markdown_summary(metrics):
             "",
         ]
     if "final_train_loss" in metrics:
+        reg_part = metrics.get("final_regularization_term")
         lines.append(
-            f"Final train loss: {metrics['final_train_loss']:.5g} "
-            f"({metrics.get('epochs_run')}/{metrics.get('epochs_configured')} epochs)"
+            f"Final train loss: {metrics['final_train_loss']:.5g}"
+            + (
+                f" = reconstruction {metrics['final_reconstruction_loss']:.5g}"
+                f" + regularization {reg_part:.5g}"
+                if reg_part
+                else ""
+            )
+            + f" ({metrics.get('epochs_run')}/{metrics.get('epochs_configured')} epochs)"
         )
     summ = metrics.get("rms_over_std_summary")
     if summ:
@@ -187,6 +199,7 @@ def main(argv=None):
         "compressed": os.path.join(out, "compressed_output", "compressed.npz"),
         "decompressed": os.path.join(out, "decompressed_output", "decompressed.npz"),
         "loss": os.path.join(out, "training", "loss_data.npy"),
+        "loss_components": os.path.join(out, "training", "loss_components.npy"),
         "original": config.input_path,
         "comparison_pdf": os.path.join(out, "plotting", "comparison.pdf"),
         "loss_pdf": os.path.join(out, "plotting", "Loss_plot.pdf"),
@@ -342,10 +355,27 @@ def main(argv=None):
                     math.isfinite(final_train),
                     f"{final_train:.6g}",
                 )
+                final_recon = final_train
+                if os.path.isfile(paths["loss_components"]):
+                    comp = np.load(paths["loss_components"])
+                    if c.check(
+                        "loss_components layout matches loss_data",
+                        comp.shape == loss.shape,
+                        f"shape {comp.shape}, loss_data {loss.shape}",
+                    ) and c.check(
+                        "loss_components values finite",
+                        bool(np.all(np.isfinite(comp))),
+                        f"{int(np.size(comp) - np.count_nonzero(np.isfinite(comp)))}"
+                        " non-finite",
+                    ):
+                        final_recon = float(comp[0, -1])
+                        metrics["final_regularization_term"] = float(comp[1, -1])
+                        metrics["recon_loss_per_epoch"] = [float(x) for x in comp[0]]
+                metrics["final_reconstruction_loss"] = final_recon
                 c.check(
-                    "final train loss below threshold",
-                    final_train < max_final_loss,
-                    f"{final_train:.6g} < {max_final_loss}",
+                    "final reconstruction loss below threshold",
+                    final_recon < max_final_loss,
+                    f"{final_recon:.6g} < {max_final_loss}",
                     kind="threshold",
                 )
 

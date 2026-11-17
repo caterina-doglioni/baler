@@ -173,6 +173,14 @@ def mse_loss_l1(model_children, true_data, reconstructed_data, reg_param, valida
         return mse_loss, 0, 0
 
 
+def l1_activation_penalty(activations):
+    """L1 sparsity penalty on hidden activations: the sum over layers of
+    mean(|activation|). `activations` is the list returned by a model's
+    forward_with_activations(). Multiply by the regularization parameter
+    (config.reg_param) before adding it to the reconstruction loss."""
+    return sum(torch.mean(torch.abs(a)) for a in activations)
+
+
 def mse_sum_loss_l1(model_children, true_data, reconstructed_data, reg_param, validate):
     """
     Computes the sum of mean squared error (MSE) loss and L1 regularization loss.

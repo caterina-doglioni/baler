@@ -151,7 +151,8 @@ jobs:
   roundtrip:
     needs: [unit, plan]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 25 epochs take ~3 min; allow long --epochs comparisons (300 epochs ~30 min).
+    timeout-minutes: ${{ needs.plan.outputs.epochs != '' && 120 || 45 }}
     strategy:
       fail-fast: false
       matrix:
@@ -200,7 +201,8 @@ jobs:
       needs.plan.outputs.baseline != 'stored'
     needs: [unit, plan]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 25 epochs take ~3 min; allow long --epochs comparisons (300 epochs ~30 min).
+    timeout-minutes: ${{ needs.plan.outputs.epochs != '' && 120 || 45 }}
     strategy:
       fail-fast: false
       matrix:
