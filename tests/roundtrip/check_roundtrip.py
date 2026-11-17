@@ -21,8 +21,8 @@ Output file layouts this script relies on (from baler at ec4b178):
     baler copies the training loss into row 1). n_epochs_run can be < config.epochs
     if early stopping triggers.
   - output/training/loss_components.npy (when present): shape (2, n_epochs_run),
-    row 0 the reconstruction part of the training loss, row 1 the weighted L1
-    part. The final-loss check uses row 0, so runs with and without L1 are held
+    row 0 the reconstruction part of the training loss, row 1 the regularization
+    part (weighted L1 and/or the SWAE term). The final-loss check uses row 0, so runs with and without L1 are held
     to the same quantity. Without the file (older baler), the training loss is
     used, which had no L1 part.
   - output/compressed_output/compressed.npz: keys data (n_rows, latent),
@@ -101,13 +101,13 @@ def markdown_summary(metrics):
             "",
         ]
     if "final_train_loss" in metrics:
-        l1_part = metrics.get("final_l1_term")
+        reg_part = metrics.get("final_regularization_term")
         lines.append(
             f"Final train loss: {metrics['final_train_loss']:.5g}"
             + (
                 f" = reconstruction {metrics['final_reconstruction_loss']:.5g}"
-                f" + L1 {l1_part:.5g}"
-                if l1_part
+                f" + regularization {reg_part:.5g}"
+                if reg_part
                 else ""
             )
             + f" ({metrics.get('epochs_run')}/{metrics.get('epochs_configured')} epochs)"
@@ -362,9 +362,14 @@ def main(argv=None):
                         "loss_components layout matches loss_data",
                         comp.shape == loss.shape,
                         f"shape {comp.shape}, loss_data {loss.shape}",
+                    ) and c.check(
+                        "loss_components values finite",
+                        bool(np.all(np.isfinite(comp))),
+                        f"{int(np.size(comp) - np.count_nonzero(np.isfinite(comp)))}"
+                        " non-finite",
                     ):
                         final_recon = float(comp[0, -1])
-                        metrics["final_l1_term"] = float(comp[1, -1])
+                        metrics["final_regularization_term"] = float(comp[1, -1])
                         metrics["recon_loss_per_epoch"] = [float(x) for x in comp[0]]
                 metrics["final_reconstruction_loss"] = final_recon
                 c.check(

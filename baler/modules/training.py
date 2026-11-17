@@ -79,8 +79,9 @@ def fit(
         n_dimensions (int): Number of dimensions.
     Returns:
         float, float, float, model object: per-epoch averages of the training
-        loss, its reconstruction part and its weighted L1 part
-        (regular_param * penalty, 0 without L1), and the trained model
+        loss, its reconstruction part, and the rest of it (the regularization
+        part: regular_param * L1 penalty and/or the SWAE sliced-Wasserstein
+        term; 0 without either), and the trained model
     """
 
     print("### Beginning Training")
@@ -89,7 +90,7 @@ def fit(
 
     running_loss = 0.0
     running_recon = 0.0
-    running_l1 = 0.0
+    running_other = 0.0
     device = helper.get_device()
 
     for idx, inputs in enumerate(tqdm(train_dl)):
@@ -109,9 +110,13 @@ def fit(
             and config.custom_loss_function == "loss_function_swae"
         ):
             z = model.encode(inputs)
-            loss, _, _ = utils.loss_function_swae(
+            # Returns (total, reconstruction part, SWD); keep the reconstruction
+            # part separate so the sliced-Wasserstein term is not reported as
+            # reconstruction loss.
+            loss, recon_part, _ = utils.loss_function_swae(
                 inputs, z, reconstructions, latent_dim
             )
+            other_part = (loss - recon_part).item()
         else:
             # Compute how far off the prediction is. validate=True: only the
             # reconstruction term; the L1 term is added below from the real
@@ -124,11 +129,14 @@ def fit(
                 reg_param=regular_param,
                 validate=True,
             )
-        running_recon += loss.item()
+            recon_part = loss
+            other_part = 0.0
+        running_recon += recon_part.item()
         if l1:
             l1_term = regular_param * utils.l1_activation_penalty(activations)
             loss = loss + l1_term
-            running_l1 += l1_term.item()
+            other_part += l1_term.item()
+        running_other += other_part
 
         # Compute the loss-gradient with
         loss.backward()
@@ -141,7 +149,7 @@ def fit(
     n_batches = idx + 1
     epoch_loss = running_loss / n_batches
     print(f"# Finished. Training Loss: {loss:.6f}")
-    return epoch_loss, running_recon / n_batches, running_l1 / n_batches, model
+    return epoch_loss, running_recon / n_batches, running_other / n_batches, model
 
 
 def validate(model, test_dl, model_children, reg_param):
@@ -324,7 +332,7 @@ def train(model, variables, train_data, test_data, project_path, config):
     train_loss = []
     val_loss = []
     recon_loss = []
-    l1_term_loss = []
+    reg_term_loss = []
     start = time.time()
 
     # Registering hooks for activation extraction
@@ -334,7 +342,7 @@ def train(model, variables, train_data, test_data, project_path, config):
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1} of {epochs}")
 
-        train_epoch_loss, recon_epoch_loss, l1_epoch_loss, trained_model = fit(
+        train_epoch_loss, recon_epoch_loss, reg_epoch_loss, trained_model = fit(
             config=config,
             model=model,
             train_dl=train_dl,
@@ -348,7 +356,7 @@ def train(model, variables, train_data, test_data, project_path, config):
         )
         train_loss.append(train_epoch_loss)
         recon_loss.append(recon_epoch_loss)
-        l1_term_loss.append(l1_epoch_loss)
+        reg_term_loss.append(reg_epoch_loss)
 
         if test_size:
             val_epoch_loss = validate(
@@ -388,11 +396,11 @@ def train(model, variables, train_data, test_data, project_path, config):
         os.path.join(project_path, "loss_data.npy"), np.array([train_loss, val_loss])
     )
     # Per-epoch parts of the training loss: row 0 reconstruction, row 1 the
-    # weighted L1 term (reg_param * penalty; zeros without L1). Row 0 + row 1 is
-    # row 0 of loss_data.npy.
+    # regularization terms (reg_param * L1 penalty and/or the SWAE term; zeros
+    # without either). Row 0 + row 1 is row 0 of loss_data.npy.
     np.save(
         os.path.join(project_path, "loss_components.npy"),
-        np.array([recon_loss, l1_term_loss]),
+        np.array([recon_loss, reg_term_loss]),
     )
 
     if config.model_type == "convolutional":

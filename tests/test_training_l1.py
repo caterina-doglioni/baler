@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from baler.modules import models, training, utils
+from baler.modules import helper, models, training, utils
 
 N_FEATURES, Z_DIM, N_ROWS = 24, 15, 64
 
@@ -13,18 +13,21 @@ L1_MODELS = [models.AE, models.CFD_dense_AE, models.FPGA_prototype_model]
 
 
 def make(model_cls, seed=0):
+    """Model and data on helper.get_device(), as training.train() does (fit()
+    moves each batch there, so a CPU model fails on a CUDA machine)."""
     torch.manual_seed(seed)
-    model = model_cls(n_features=N_FEATURES, z_dim=Z_DIM)
+    device = helper.get_device()
+    model = model_cls(n_features=N_FEATURES, z_dim=Z_DIM).to(device)
     dtype = next(model.parameters()).dtype
-    data = torch.rand(N_ROWS, N_FEATURES, dtype=dtype)
+    data = torch.rand(N_ROWS, N_FEATURES, dtype=dtype).to(device)
     return model, data
 
 
-def run_fit(model, data, l1, reg):
-    """One fit() epoch over a single batch; returns (loss, recon, l1 part)."""
+def run_fit(model, data, l1, reg, config=None):
+    """One fit() epoch over a single batch; returns (loss, recon, other part)."""
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)  # lr 0: weights fixed
     loss, recon, l1_part, _ = training.fit(
-        config=types.SimpleNamespace(),
+        config=config or types.SimpleNamespace(),
         model=model,
         train_dl=DataLoader(data, batch_size=N_ROWS),
         model_children=list(model.children()),
@@ -79,6 +82,22 @@ def test_fit_with_l1_adds_weighted_penalty(model_cls):
     assert l1_part == pytest.approx(expected_l1)
     assert l1_part > 0
     assert loss == pytest.approx(recon + l1_part)
+
+
+def test_fit_swae_term_is_not_reconstruction():
+    """With the SWAE loss, the reconstruction part is the MSE term only; the
+    sliced-Wasserstein term goes to the other (regularization) part.
+    CFD_dense_AE (float32): compute_swd draws float32 projections, so the SWAE
+    loss fails for the float64 models, on main as well."""
+    model, data = make(models.CFD_dense_AE)
+    # The reconstruction part is deterministic; the SWD term uses random
+    # projections, so only its consistency with the total is checked.
+    expected_recon = utils.mse_sum_loss_l1([], data, model(data), 0.0, True)[0]
+    cfg = types.SimpleNamespace(custom_loss_function="loss_function_swae")
+    loss, recon, other = run_fit(model, data, l1=False, reg=0.0, config=cfg)
+    assert recon == pytest.approx(expected_recon.item())
+    assert other > 0
+    assert recon + other == pytest.approx(loss)
 
 
 def test_fit_with_l1_and_zero_reg_equals_no_l1():
