@@ -9,7 +9,10 @@ Run from the repository root, after the four modes have run (see run_roundtrip.s
 
 Thresholds are read from tests/roundtrip/thresholds.json (override with --thresholds).
 Exit status is 0 if every check passes, 1 otherwise. The metrics JSON is written
-in both cases so failed runs keep their diagnostics.
+in both cases so failed runs keep their diagnostics. With --thresholds-informational
+(used by the comparison mode, and whenever the epoch count is overridden) the
+thresholds.json limits are still evaluated and reported, but only structural
+failures set exit status 1.
 
 Output file layouts this script relies on (from baler at ec4b178):
   - output/training/loss_data.npy: written by modules/training.py as
@@ -66,8 +69,14 @@ def markdown_summary(metrics):
     """Short markdown report: check results, key numbers, per-variable rms/std."""
     ok = metrics.get("all_passed")
     v = metrics.get("versions", {})
+    if ok:
+        title = "✅ all checks passed"
+    elif metrics.get("thresholds_informational") and metrics.get("structural_passed"):
+        title = "⚠️ threshold limits exceeded (informational in this run)"
+    else:
+        title = "❌ checks failed"
     lines = [
-        f"## Round trip: {'✅ all checks passed' if ok else '❌ checks failed'}",
+        f"## Round trip: {title}",
         "",
         f"Python {v.get('python')}, torch {v.get('torch')}, numpy {v.get('numpy')}; "
         f"thresholds: `{metrics.get('thresholds_status')}`",
@@ -141,6 +150,10 @@ class Checker:
     def all_passed(self):
         return all(r["passed"] for r in self.results)
 
+    @property
+    def structural_passed(self):
+        return all(r["passed"] for r in self.results if r["kind"] == "structural")
+
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -152,6 +165,11 @@ def main(argv=None):
     p.add_argument(
         "--summary-md",
         help="optional file to append a markdown summary to (e.g. $GITHUB_STEP_SUMMARY)",
+    )
+    p.add_argument(
+        "--thresholds-informational",
+        action="store_true",
+        help="report threshold-limit failures but exit 0 unless a structural check fails",
     )
     args = p.parse_args(argv)
 
@@ -181,6 +199,7 @@ def main(argv=None):
         "config": config_path,
         "thresholds_file": os.path.relpath(args.thresholds),
         "thresholds_status": thresholds.get("_status"),
+        "thresholds_informational": args.thresholds_informational,
         "reference": (
             {
                 k: reference[k]
@@ -204,6 +223,7 @@ def main(argv=None):
     def finish():
         metrics["checks"] = c.results
         metrics["all_passed"] = c.all_passed
+        metrics["structural_passed"] = c.structural_passed
         with open(args.metrics_out, "w") as f:
             json.dump(metrics, f, indent=2)
         if args.summary_md:
@@ -214,6 +234,10 @@ def main(argv=None):
             f"\n{'ALL CHECKS PASSED' if c.all_passed else f'{n_fail} CHECK(S) FAILED'}"
             f" ({len(c.results)} total). Metrics: {args.metrics_out}"
         )
+        if args.thresholds_informational:
+            if c.structural_passed and not c.all_passed:
+                print("Threshold failures are informational in this run: exit 0.")
+            return 0 if c.structural_passed else 1
         return 0 if c.all_passed else 1
 
     if args.timings:

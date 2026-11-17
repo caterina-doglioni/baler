@@ -10,6 +10,15 @@
 #   timings.json, roundtrip_metrics.json, <mode>.log
 # If ROUNDTRIP_SUMMARY_MD is set, a markdown summary is appended to that file
 # (CI sets it to $GITHUB_STEP_SUMMARY).
+#
+# Optional:
+#   ROUNDTRIP_EPOCHS=N  train for N epochs instead of the config's value. The
+#                       config file is edited for the run and restored on exit.
+#                       The thresholds are calibrated at the config's epochs, so
+#                       they become informational (see below).
+#   ROUNDTRIP_THRESHOLDS_INFORMATIONAL=1
+#                       report thresholds.json limits but fail only on
+#                       structural checks (used by the comparison mode).
 set -euo pipefail
 
 WORKSPACE="${1:-CMS_workspace}"
@@ -20,6 +29,33 @@ PYTHON="${PYTHON:-python}"
 if [[ ! -d "workspaces/${WORKSPACE}/${PROJECT}" ]]; then
     echo "error: workspaces/${WORKSPACE}/${PROJECT} not found; run from the repo root" >&2
     exit 2
+fi
+
+informational="${ROUNDTRIP_THRESHOLDS_INFORMATIONAL:-}"
+if [[ -n "${ROUNDTRIP_EPOCHS:-}" ]]; then
+    if ! [[ "${ROUNDTRIP_EPOCHS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "error: ROUNDTRIP_EPOCHS must be a positive integer, got '${ROUNDTRIP_EPOCHS}'" >&2
+        exit 2
+    fi
+    config="workspaces/${WORKSPACE}/${PROJECT}/config/${PROJECT}_config.py"
+    if ! grep -qE '^    c\.epochs = [0-9]+$' "${config}"; then
+        echo "error: no 'c.epochs = <int>' line in ${config}" >&2
+        exit 2
+    fi
+    # Python validates a cached .pyc by the source's mtime (whole seconds) and
+    # size. Editing 25 -> 10 keeps the size, and the backup, the edit and the
+    # restore can all fall in the same second, so a cached .pyc could make the
+    # override, or the restored value, silently not take effect. Drop this
+    # config's cached bytecode before the override and after the restore.
+    config_pyc="workspaces/${WORKSPACE}/${PROJECT}/config/__pycache__/${PROJECT}_config.*.pyc"
+    drop_config_pyc() { rm -f ${config_pyc}; }
+    cp "${config}" "${config}.roundtrip_orig"
+    trap 'mv "${config}.roundtrip_orig" "${config}"; drop_config_pyc' EXIT
+    sed -i.bak -E "s/^    c\.epochs = [0-9]+$/    c.epochs = ${ROUNDTRIP_EPOCHS}/" "${config}"
+    rm -f "${config}.bak"
+    drop_config_pyc
+    echo "=== epochs overridden: $(grep -E '^    c\.epochs = ' "${config}") ==="
+    informational=1
 fi
 
 mkdir -p "${OUT_DIR}"
@@ -59,6 +95,9 @@ fi
 summary_args=()
 if [[ -n "${ROUNDTRIP_SUMMARY_MD:-}" ]]; then
     summary_args=(--summary-md "${ROUNDTRIP_SUMMARY_MD}")
+fi
+if [[ -n "${informational}" ]]; then
+    summary_args+=(--thresholds-informational)
 fi
 
 "${PYTHON}" tests/roundtrip/check_roundtrip.py \
