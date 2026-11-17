@@ -5,11 +5,19 @@ name: CI
 # config unchanged (25 epochs). The round trip is checked by
 # tests/roundtrip/check_roundtrip.py against tests/roundtrip/thresholds.json.
 #
-# Comparison mode (workflow_dispatch with compare_baseline set): the round trip
-# runs once per roundtrip_runs entry, the thresholds become informational, and
+# Comparison mode: the round trip runs N times on the head and N times on a
+# baseline, the thresholds become informational, and
 # tests/roundtrip/compare_runs.py reports whether the head is better or worse
-# than the baseline. It never fails on worse results; only structural failures
-# (missing files, wrong shapes, non-finite values) fail the run.
+# (step summary + "comparison" artifact). It never fails on worse results; only
+# structural failures (missing files, wrong shapes, non-finite values) fail.
+#
+# When it runs (decided by the "plan" job):
+#   - pull_request that touches anything able to change the results (baler/,
+#     tests/roundtrip/, the CMS workspace, pyproject.toml, uv.lock, workflows):
+#     automatically, PR_COMPARE_RUNS runs per side, baseline = the PR's base commit;
+#   - workflow_dispatch with compare_baseline set: as requested;
+#   - otherwise (other PRs, push to main, plain dispatch): one round trip,
+#     checked against the thresholds.json limits as a pass/fail breakage check.
 
 on:
   pull_request:
@@ -46,8 +54,61 @@ concurrency:
 env:
   # Highest Python supported by requires-python in pyproject.toml.
   PYTHON_HIGHEST: "3.15"
+  # Round trips per side in the automatic PR comparison. 10 per side catches a
+  # 1.5x change in the overall median every time, 1.2x about 40% of the time.
+  PR_COMPARE_RUNS: "10"
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read  # list the PR's changed files
+    outputs:
+      runs: ${{ steps.plan.outputs.runs }}
+      baseline: ${{ steps.plan.outputs.baseline }}
+      epochs: ${{ steps.plan.outputs.epochs }}
+      head_desc: ${{ steps.plan.outputs.head_desc }}
+      base_desc: ${{ steps.plan.outputs.base_desc }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_RUNS: ${{ github.event.inputs.roundtrip_runs }}
+          IN_BASELINE: ${{ github.event.inputs.compare_baseline }}
+          IN_EPOCHS: ${{ github.event.inputs.epochs }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          runs='[1]'; baseline=''; epochs=''; base_desc=''
+          head_desc="${GITHUB_REF_NAME}@${GITHUB_SHA::7}"
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch)
+              runs="${IN_RUNS:-[1]}"; baseline="$IN_BASELINE"; epochs="$IN_EPOCHS"
+              base_desc="$IN_BASELINE"
+              ;;
+            pull_request)
+              files=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[].filename')
+              relevant=$(grep -E '^(baler/|tests/roundtrip/|workspaces/CMS_workspace/|pyproject\.toml$|uv\.lock$|\.github/workflows/)' <<< "$files" || true)
+              if [[ -n "$relevant" ]]; then
+                runs=$(python3 -c "import json,sys; print(json.dumps(list(range(1, int(sys.argv[1]) + 1))))" "$PR_COMPARE_RUNS")
+                baseline="$PR_BASE_SHA"
+                head_desc="PR #${PR_NUMBER} (${PR_HEAD}@${PR_HEAD_SHA::7}, merged into ${PR_BASE})"
+                base_desc="${PR_BASE}@${PR_BASE_SHA::7}"
+                echo "Files that can change the results:"; sed 's/^/  /' <<< "$relevant"
+              else
+                echo "No file that can change the results; single round trip only."
+              fi
+              ;;
+          esac
+          {
+            echo "runs=$runs"; echo "baseline=$baseline"; echo "epochs=$epochs"
+            echo "head_desc=$head_desc"; echo "base_desc=$base_desc"
+          } | tee -a "$GITHUB_OUTPUT"
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -88,13 +149,13 @@ jobs:
         run: uv run --locked pytest
 
   roundtrip:
-    needs: unit
+    needs: [unit, plan]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        run: ${{ fromJSON(github.event.inputs.roundtrip_runs || '[1]') }}
+        run: ${{ fromJSON(needs.plan.outputs.runs) }}
     name: roundtrip (run ${{ matrix.run }})
     steps:
       # The bundled example data (workspaces/CMS_workspace/data/example_CMS_data.npz,
@@ -112,8 +173,8 @@ jobs:
 
       - name: round trip (train, compress, decompress, plot, check)
         env:
-          ROUNDTRIP_EPOCHS: ${{ github.event.inputs.epochs }}
-          ROUNDTRIP_THRESHOLDS_INFORMATIONAL: ${{ (github.event.inputs.compare_baseline || '') != '' && '1' || '' }}
+          ROUNDTRIP_EPOCHS: ${{ needs.plan.outputs.epochs }}
+          ROUNDTRIP_THRESHOLDS_INFORMATIONAL: ${{ needs.plan.outputs.baseline != '' && '1' || '' }}
         run: |
           ROUNDTRIP_OUT=roundtrip_results \
           ROUNDTRIP_SUMMARY_MD="$GITHUB_STEP_SUMMARY" \
@@ -135,21 +196,20 @@ jobs:
     # commit (its code, its uv.lock), driven by this commit's tests/roundtrip
     # harness so both sides are measured the same way.
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.compare_baseline != '' &&
-      github.event.inputs.compare_baseline != 'stored'
-    needs: unit
+      needs.plan.outputs.baseline != '' &&
+      needs.plan.outputs.baseline != 'stored'
+    needs: [unit, plan]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        run: ${{ fromJSON(github.event.inputs.roundtrip_runs || '[1]') }}
+        run: ${{ fromJSON(needs.plan.outputs.runs) }}
     name: roundtrip baseline (run ${{ matrix.run }})
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.compare_baseline }}
+          ref: ${{ needs.plan.outputs.baseline }}
 
       - name: use this commit's round-trip harness
         run: |
@@ -168,7 +228,7 @@ jobs:
 
       - name: round trip (train, compress, decompress, plot, check)
         env:
-          ROUNDTRIP_EPOCHS: ${{ github.event.inputs.epochs }}
+          ROUNDTRIP_EPOCHS: ${{ needs.plan.outputs.epochs }}
           ROUNDTRIP_THRESHOLDS_INFORMATIONAL: "1"
         run: |
           ROUNDTRIP_OUT=roundtrip_results \
@@ -185,11 +245,10 @@ jobs:
   compare:
     if: >-
       always() &&
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.compare_baseline != '' &&
+      needs.plan.outputs.baseline != '' &&
       needs.roundtrip.result != 'cancelled' &&
       needs.roundtrip-baseline.result != 'cancelled'
-    needs: [roundtrip, roundtrip-baseline]
+    needs: [plan, roundtrip, roundtrip-baseline]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -210,7 +269,7 @@ jobs:
           path: head_runs
 
       - name: download baseline runs
-        if: github.event.inputs.compare_baseline != 'stored'
+        if: needs.plan.outputs.baseline != 'stored'
         uses: actions/download-artifact@v8
         with:
           pattern: baseline-results-run*
@@ -218,8 +277,10 @@ jobs:
 
       - name: compare
         env:
-          BASELINE: ${{ github.event.inputs.compare_baseline }}
-          EPOCHS: ${{ github.event.inputs.epochs }}
+          BASELINE: ${{ needs.plan.outputs.baseline }}
+          EPOCHS: ${{ needs.plan.outputs.epochs }}
+          HEAD_DESC: ${{ needs.plan.outputs.head_desc }}
+          BASE_DESC: ${{ needs.plan.outputs.base_desc }}
         run: |
           shopt -s nullglob
           head=(head_runs/*/roundtrip_results/roundtrip_metrics.json)
@@ -232,13 +293,14 @@ jobs:
             base_args=(--base-stored tests/roundtrip/thresholds.json)
           else
             base=(base_runs/*/roundtrip_metrics.json)
-            base_args=(--base "${base[@]}" --base-desc "${BASELINE}${epochs_note}")
+            base_args=(--base "${base[@]}" --base-desc "${BASE_DESC}${epochs_note}")
           fi
           uv run --locked tests/roundtrip/compare_runs.py \
-            --head "${head[@]}" --head-desc "${GITHUB_REF_NAME}@${GITHUB_SHA::7}${epochs_note}" \
+            --head "${head[@]}" --head-desc "${HEAD_DESC}${epochs_note}" \
             "${base_args[@]}" \
             --out comparison.json --plot comparison.png \
-            --summary-md "$GITHUB_STEP_SUMMARY"
+            --summary-md comparison.md
+          cat comparison.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: upload comparison
         if: always()
@@ -246,6 +308,7 @@ jobs:
         with:
           name: comparison
           path: |
+            comparison.md
             comparison.json
             comparison.png
           if-no-files-found: warn
