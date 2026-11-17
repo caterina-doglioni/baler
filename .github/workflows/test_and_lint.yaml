@@ -4,6 +4,12 @@ name: CI
 # (train -> compress -> decompress -> plot) on the bundled CMS example with its
 # config unchanged (25 epochs). The round trip is checked by
 # tests/roundtrip/check_roundtrip.py against tests/roundtrip/thresholds.json.
+#
+# Comparison mode (workflow_dispatch with compare_baseline set): the round trip
+# runs once per roundtrip_runs entry, the thresholds become informational, and
+# tests/roundtrip/compare_runs.py reports whether the head is better or worse
+# than the baseline. It never fails on worse results; only structural failures
+# (missing files, wrong shapes, non-finite values) fail the run.
 
 on:
   pull_request:
@@ -16,6 +22,19 @@ on:
           JSON list of run labels; one independent round-trip job per entry,
           e.g. [1,2,3,4,5] to collect data for threshold calibration.
         default: "[1]"
+      compare_baseline:
+        description: >-
+          Comparison mode. Empty: off. "stored": compare with the 20 runs stored
+          in tests/roundtrip/thresholds.json. A branch, tag or SHA (e.g. main):
+          run the same number of round trips on that commit, with this commit's
+          tests/roundtrip harness, and compare. Use 10 or more runs per side,
+          e.g. roundtrip_runs=[1,2,3,4,5,6,7,8,9,10].
+        default: ""
+      epochs:
+        description: >-
+          Optional: train for this many epochs instead of the config's value
+          (both sides of a comparison). Makes the thresholds informational.
+        default: ""
 
 permissions:
   contents: read
@@ -92,6 +111,9 @@ jobs:
         run: uv sync --locked
 
       - name: round trip (train, compress, decompress, plot, check)
+        env:
+          ROUNDTRIP_EPOCHS: ${{ github.event.inputs.epochs }}
+          ROUNDTRIP_THRESHOLDS_INFORMATIONAL: ${{ (github.event.inputs.compare_baseline || '') != '' && '1' || '' }}
         run: |
           ROUNDTRIP_OUT=roundtrip_results \
           ROUNDTRIP_SUMMARY_MD="$GITHUB_STEP_SUMMARY" \
@@ -106,4 +128,124 @@ jobs:
             roundtrip_results/
             workspaces/CMS_workspace/CMS_project_v1/output/plotting/comparison.pdf
             workspaces/CMS_workspace/CMS_project_v1/output/plotting/Loss_plot.pdf
+          if-no-files-found: warn
+
+  roundtrip-baseline:
+    # Comparison mode against a git ref: the same round trip on the baseline
+    # commit (its code, its uv.lock), driven by this commit's tests/roundtrip
+    # harness so both sides are measured the same way.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.compare_baseline != '' &&
+      github.event.inputs.compare_baseline != 'stored'
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(github.event.inputs.roundtrip_runs || '[1]') }}
+    name: roundtrip baseline (run ${{ matrix.run }})
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.compare_baseline }}
+
+      - name: use this commit's round-trip harness
+        run: |
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout "$GITHUB_SHA" -- tests/roundtrip
+          echo "baseline code: $(git rev-parse HEAD), harness: $GITHUB_SHA"
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ env.PYTHON_HIGHEST }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: install dependencies (fails if uv.lock is stale)
+        run: uv sync --locked
+
+      - name: round trip (train, compress, decompress, plot, check)
+        env:
+          ROUNDTRIP_EPOCHS: ${{ github.event.inputs.epochs }}
+          ROUNDTRIP_THRESHOLDS_INFORMATIONAL: "1"
+        run: |
+          ROUNDTRIP_OUT=roundtrip_results \
+            uv run --locked tests/roundtrip/run_roundtrip.sh
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: baseline-results-run${{ matrix.run }}
+          path: roundtrip_results/
+          if-no-files-found: warn
+
+  compare:
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.compare_baseline != '' &&
+      needs.roundtrip.result != 'cancelled' &&
+      needs.roundtrip-baseline.result != 'cancelled'
+    needs: [roundtrip, roundtrip-baseline]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ env.PYTHON_HIGHEST }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: install dependencies (fails if uv.lock is stale)
+        run: uv sync --locked
+
+      - name: download head runs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: roundtrip-results-run*
+          path: head_runs
+
+      - name: download baseline runs
+        if: github.event.inputs.compare_baseline != 'stored'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: baseline-results-run*
+          path: base_runs
+
+      - name: compare
+        env:
+          BASELINE: ${{ github.event.inputs.compare_baseline }}
+          EPOCHS: ${{ github.event.inputs.epochs }}
+        run: |
+          shopt -s nullglob
+          head=(head_runs/*/roundtrip_results/roundtrip_metrics.json)
+          epochs_note="${EPOCHS:+, ${EPOCHS} epochs}"
+          if [[ "$BASELINE" == "stored" ]]; then
+            if [[ -n "$EPOCHS" ]]; then
+              echo "error: the stored runs are at the config's epochs; use a git ref as baseline with an epochs override" >&2
+              exit 2
+            fi
+            base_args=(--base-stored tests/roundtrip/thresholds.json)
+          else
+            base=(base_runs/*/roundtrip_metrics.json)
+            base_args=(--base "${base[@]}" --base-desc "${BASELINE}${epochs_note}")
+          fi
+          uv run --locked tests/roundtrip/compare_runs.py \
+            --head "${head[@]}" --head-desc "${GITHUB_REF_NAME}@${GITHUB_SHA::7}${epochs_note}" \
+            "${base_args[@]}" \
+            --out comparison.json --plot comparison.png \
+            --summary-md "$GITHUB_STEP_SUMMARY"
+
+      - name: upload comparison
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: comparison
+          path: |
+            comparison.json
+            comparison.png
           if-no-files-found: warn
