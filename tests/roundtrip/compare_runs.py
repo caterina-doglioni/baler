@@ -44,7 +44,7 @@ sys.path.insert(0, HERE)
 from calibrate_thresholds import check_kind  # noqa: E402
 
 OVERALL = "median over variables"
-LOSS = "final train loss"
+LOSS = "final reconstruction loss"
 
 
 # ---------------------------------------------------------------- loading
@@ -68,7 +68,9 @@ def load_run(path):
         if pv["rms_over_std"] is not None
     }
     values[OVERALL] = m["rms_over_std_summary"]["median"]
-    values[LOSS] = m["final_train_loss"]
+    # The reconstruction part, so runs with and without an L1 term compare the
+    # same quantity; older metrics files (no L1 in baler) only have the total.
+    values[LOSS] = m.get("final_reconstruction_loss", m["final_train_loss"])
     return values
 
 

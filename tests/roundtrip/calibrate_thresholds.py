@@ -19,7 +19,8 @@ import sys
 # Checks that compare against a limit from thresholds.json. Metrics files
 # written before checks carried a "kind" field are classified by name.
 THRESHOLD_CHECKS = {
-    "final train loss below threshold",
+    "final train loss below threshold",  # name before loss_components.npy
+    "final reconstruction loss below threshold",
     "per-variable rms/std within thresholds",
 }
 
@@ -92,7 +93,8 @@ def main(argv=None):
     per_var_raw = {
         n: [m["per_variable"][n]["rms_over_std"] for m in runs] for n in names
     }
-    losses = [m["final_train_loss"] for m in runs]
+    # Reconstruction part when available (the key names below predate L1).
+    losses = [m.get("final_reconstruction_loss", m["final_train_loss"]) for m in runs]
 
     per_var_limit = {
         n: round(max(args.factor * max(v), args.floor), 6)

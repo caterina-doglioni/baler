@@ -48,10 +48,15 @@ def fit(
         regular_param (float): Determines proportionality constant for the gradient descent step.
         optimizer (torch.optim): Chooses optimizer for gradient descent.
         RHO (float): Float used for KL Divergence (Not currently a feature)
-        l1 (boolean): If `True`, use L1 regularization. Otherwise, don't.
+        l1 (boolean): If `True`, add regular_param times the L1 penalty on the
+            model's hidden activations (utils.l1_activation_penalty on the output of
+            model.forward_with_activations) to the reconstruction loss. train()
+            switches it off, with a warning, for models without that method.
         n_dimensions (int): Number of dimensions.
     Returns:
-        list, model object: Training loss and trained model
+        float, float, float, model object: per-epoch averages of the training
+        loss, its reconstruction part and its weighted L1 part
+        (regular_param * penalty, 0 without L1), and the trained model
     """
 
     print("### Beginning Training")
@@ -59,6 +64,8 @@ def fit(
     model.train()
 
     running_loss = 0.0
+    running_recon = 0.0
+    running_l1 = 0.0
     device = helper.get_device()
 
     for idx, inputs in enumerate(tqdm(train_dl)):
@@ -68,25 +75,36 @@ def fit(
         optimizer.zero_grad()
 
         # Compute the predicted outputs from the input data
-        reconstructions = model(inputs)
+        if l1:
+            reconstructions, activations = model.forward_with_activations(inputs)
+        else:
+            reconstructions = model(inputs)
 
         if (
             hasattr(config, "custom_loss_function")
             and config.custom_loss_function == "loss_function_swae"
         ):
             z = model.encode(inputs)
-            loss, mse_loss, l1_loss = utils.loss_function_swae(
+            loss, _, _ = utils.loss_function_swae(
                 inputs, z, reconstructions, latent_dim
             )
         else:
-            # Compute how far off the prediction is
-            loss, mse_loss, l1_loss = utils.mse_sum_loss_l1(
+            # Compute how far off the prediction is. validate=True: only the
+            # reconstruction term; the L1 term is added below from the real
+            # forward pass (the validate=False path of mse_sum_loss_l1 re-runs the
+            # layers chained with relu, which is not the model's forward pass).
+            loss, _, _ = utils.mse_sum_loss_l1(
                 model_children=model_children,
                 true_data=inputs,
                 reconstructed_data=reconstructions,
                 reg_param=regular_param,
                 validate=True,
             )
+        running_recon += loss.item()
+        if l1:
+            l1_term = regular_param * utils.l1_activation_penalty(activations)
+            loss = loss + l1_term
+            running_l1 += l1_term.item()
 
         # Compute the loss-gradient with
         loss.backward()
@@ -96,9 +114,10 @@ def fit(
 
         running_loss += loss.item()
 
-    epoch_loss = running_loss / (idx + 1)
+    n_batches = idx + 1
+    epoch_loss = running_loss / n_batches
     print(f"# Finished. Training Loss: {loss:.6f}")
-    return epoch_loss, mse_loss, l1_loss, model
+    return epoch_loss, running_recon / n_batches, running_l1 / n_batches, model
 
 
 def validate(model, test_dl, model_children, reg_param):
@@ -277,9 +296,18 @@ def train(model, variables, train_data, test_data, project_path, config):
             optimizer=optimizer, patience=config.lr_scheduler_patience
         )
 
+    if l1 and not hasattr(model, "forward_with_activations"):
+        print(
+            f"WARNING: config.l1 is True but {type(model).__name__} has no "
+            "forward_with_activations(); training without the L1 penalty."
+        )
+        l1 = False
+
     # Training and Validation of the model
     train_loss = []
     val_loss = []
+    recon_loss = []
+    l1_term_loss = []
     start = time.time()
 
     # Registering hooks for activation extraction
@@ -289,7 +317,7 @@ def train(model, variables, train_data, test_data, project_path, config):
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1} of {epochs}")
 
-        train_epoch_loss, mse_loss_fit, regularizer_loss_fit, trained_model = fit(
+        train_epoch_loss, recon_epoch_loss, l1_epoch_loss, trained_model = fit(
             config=config,
             model=model,
             train_dl=train_dl,
@@ -302,6 +330,8 @@ def train(model, variables, train_data, test_data, project_path, config):
             n_dimensions=config.data_dimension,
         )
         train_loss.append(train_epoch_loss)
+        recon_loss.append(recon_epoch_loss)
+        l1_term_loss.append(l1_epoch_loss)
 
         if test_size:
             val_epoch_loss = validate(
@@ -339,6 +369,13 @@ def train(model, variables, train_data, test_data, project_path, config):
     print(f"{(end - start) / 60:.3} minutes")
     np.save(
         os.path.join(project_path, "loss_data.npy"), np.array([train_loss, val_loss])
+    )
+    # Per-epoch parts of the training loss: row 0 reconstruction, row 1 the
+    # weighted L1 term (reg_param * penalty; zeros without L1). Row 0 + row 1 is
+    # row 0 of loss_data.npy.
+    np.save(
+        os.path.join(project_path, "loss_components.npy"),
+        np.array([recon_loss, l1_term_loss]),
     )
 
     if config.model_type == "convolutional":

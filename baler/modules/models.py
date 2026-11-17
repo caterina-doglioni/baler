@@ -155,6 +155,20 @@ class AE(nn.Module):
         z = self.encode(x)
         return self.decode(z)
 
+    def forward_with_activations(self, x):
+        """forward(), also returning the hidden activations the L1 penalty acts on:
+        the outputs of en1-3 and de1-3 after leaky_relu. The latent (en4) and the
+        output (de4) are not included. Same operations as forward(), so the
+        reconstruction is identical."""
+        h1 = F.leaky_relu(self.en1(x))
+        h2 = F.leaky_relu(self.en2(h1))
+        h3 = F.leaky_relu(self.en3(h2))
+        z = self.en4(h3)
+        h4 = F.leaky_relu(self.de1(z))
+        h5 = F.leaky_relu(self.de2(h4))
+        h6 = F.leaky_relu(self.de3(h5))
+        return self.de4(h6), [h1, h2, h3, h4, h5, h6]
+
     # Implementation of activation extraction using the forward_hook method
 
     def get_hook(self, layer_name):
@@ -224,6 +238,20 @@ class CFD_dense_AE(nn.Module):
     def forward(self, x):
         z = self.encode(x)
         return self.decode(z)
+
+    def forward_with_activations(self, x):
+        """forward(), also returning the hidden activations the L1 penalty acts on:
+        the outputs of en1-3 and de1-3 after leaky_relu. The latent (en4) and the
+        output (de4) are not included. Same operations as forward(), so the
+        reconstruction is identical."""
+        h1 = F.leaky_relu(self.en1(x))
+        h2 = F.leaky_relu(self.en2(h1))
+        h3 = F.leaky_relu(self.en3(h2))
+        z = self.en4(h3)
+        h4 = F.leaky_relu(self.de1(z))
+        h5 = F.leaky_relu(self.de2(h4))
+        h6 = F.leaky_relu(self.de3(h5))
+        return self.de4(h6), [h1, h2, h3, h4, h5, h6]
 
     # Implementation of activation extraction using the forward_hook method
 
@@ -447,6 +475,17 @@ class FPGA_prototype_model(nn.Module):
     def forward(self, x):
         z = self.encode(x)
         return self.decode(z)
+
+    def forward_with_activations(self, x):
+        """forward(), also returning the hidden activations the L1 penalty acts on:
+        the four ReLU outputs. The latent (en3) and the output (de3) are not
+        included. Same operations as forward(), so the reconstruction is identical."""
+        s2 = self.en_act1(self.en1(x))
+        s4 = self.en_act2(self.en2(s2))
+        z = self.en3(s4)
+        s7 = self.de_act1(self.de1(z))
+        s9 = self.de_act2(self.de2(s7))
+        return self.de3(s9), [s2, s4, s7, s9]
 
     def get_layers(self) -> list:
         return [
