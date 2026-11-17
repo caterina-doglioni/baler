@@ -266,25 +266,47 @@ def plot(head_runs, base_runs, results, path):
     qs = [q for q in results if q != LOSS]
     fig, ax = plt.subplots(figsize=(10, 0.35 * len(qs) + 1.5))
     rng = np.random.default_rng(1)
+    # Log axis: values of exactly 0 (rare-count variables) cannot be drawn where
+    # they are, so they go at a fixed left edge with a distinct marker. Medians
+    # come from `results`, i.e. over all runs including the zeros, so the bars
+    # agree with the JSON/markdown report.
+    positive = [v for q in qs for v in (*h[q], *b[q]) if v > 0]
+    zero_x = min(positive) / 3 if positive else 1e-3
     for i, q in enumerate(qs):
-        for vals, off, color, label in (
-            (b[q], -0.15, "tab:gray", "baseline"),
-            (h[q], 0.15, "tab:blue", "head"),
+        for vals, med, off, color, label in (
+            (b[q], results[q]["base_median"], -0.15, "tab:gray", "baseline"),
+            (h[q], results[q]["head_median"], 0.15, "tab:blue", "head"),
         ):
-            vals = vals[vals > 0]  # log axis
-            y = i + off + rng.uniform(-0.06, 0.06, len(vals))
+            pos, n_zero = vals[vals > 0], int(np.sum(vals <= 0))
+            y = i + off + rng.uniform(-0.06, 0.06, len(pos))
             ax.scatter(
-                vals, y, s=8, color=color, alpha=0.6, label=label if i == 0 else None
+                pos, y, s=8, color=color, alpha=0.6, label=label if i == 0 else None
             )
-            if len(vals):
-                ax.plot(
-                    [np.median(vals)] * 2, [i + off - 0.12, i + off + 0.12], color=color
+            if n_zero:
+                ax.scatter([zero_x], [i + off], s=18, marker="<", color=color)
+                ax.annotate(
+                    f"{n_zero}×0",
+                    (zero_x, i + off),
+                    xytext=(4, -2),
+                    textcoords="offset points",
+                    fontsize=6,
+                    color=color,
                 )
+            ax.plot(
+                [med if med > 0 else zero_x] * 2,
+                [i + off - 0.12, i + off + 0.12],
+                color=color,
+                linestyle="-" if med > 0 else ":",
+            )
+    ax.axvline(zero_x * 1.6, color="0.85", linewidth=0.8)
     ax.set_yticks(range(len(qs)))
     ax.set_yticklabels([short(q) for q in qs], fontsize=7)
     ax.invert_yaxis()
     ax.set_xscale("log")
-    ax.set_xlabel("rms(residual) / std(original)  (lower is better; bars = medians)")
+    ax.set_xlabel(
+        "rms(residual) / std(original)  (lower is better; bars = medians over all runs)\n"
+        "◁ n×0: n runs with value 0, drawn at the left edge; dotted bar: median is 0"
+    )
     ax.legend(loc="lower right")
     fig.tight_layout()
     fig.savefig(path, dpi=120)

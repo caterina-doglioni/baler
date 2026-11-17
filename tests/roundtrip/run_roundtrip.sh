@@ -42,10 +42,18 @@ if [[ -n "${ROUNDTRIP_EPOCHS:-}" ]]; then
         echo "error: no 'c.epochs = <int>' line in ${config}" >&2
         exit 2
     fi
+    # Python validates a cached .pyc by the source's mtime (whole seconds) and
+    # size. Editing 25 -> 10 keeps the size, and the backup, the edit and the
+    # restore can all fall in the same second, so a cached .pyc could make the
+    # override, or the restored value, silently not take effect. Drop this
+    # config's cached bytecode before the override and after the restore.
+    config_pyc="workspaces/${WORKSPACE}/${PROJECT}/config/__pycache__/${PROJECT}_config.*.pyc"
+    drop_config_pyc() { rm -f ${config_pyc}; }
     cp "${config}" "${config}.roundtrip_orig"
-    trap 'mv "${config}.roundtrip_orig" "${config}"' EXIT
+    trap 'mv "${config}.roundtrip_orig" "${config}"; drop_config_pyc' EXIT
     sed -i.bak -E "s/^    c\.epochs = [0-9]+$/    c.epochs = ${ROUNDTRIP_EPOCHS}/" "${config}"
     rm -f "${config}.bak"
+    drop_config_pyc
     echo "=== epochs overridden: $(grep -E '^    c\.epochs = ' "${config}") ==="
     informational=1
 fi

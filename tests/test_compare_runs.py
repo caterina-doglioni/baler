@@ -176,3 +176,15 @@ def test_stored_baseline_matches_thresholds_json():
         raw = json.load(f)["_raw"]
     assert len(runs) == len(raw["final_train_loss"])
     assert set(raw["rms_over_std"]) <= set(runs[0])
+
+
+def test_plot_with_zero_heavy_variable(tmp_path):
+    base = synthetic_runs(10, seed=1)
+    head = synthetic_runs(10, seed=2)
+    for i, r in enumerate(base):
+        r["v0"] = 0.0 if i < 8 else 0.02  # median 0, like mElectronMultiplicity
+    res = cr.compare(head, base, n_boot=200)
+    assert res["v0"]["base_median"] == 0.0
+    out = tmp_path / "p.png"
+    cr.plot(head, base, res, str(out))
+    assert out.stat().st_size > 0
