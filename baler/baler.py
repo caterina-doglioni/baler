@@ -18,7 +18,7 @@ from math import ceil
 
 import numpy as np
 
-from .modules import helper
+from .modules import data_processing, helper
 import gzip
 from .modules.profiling import pytorch_profile
 
@@ -155,7 +155,11 @@ def perform_training(output_path, config, verbose: bool):
         print(f"Device used for training: {device}")
 
     model_object = helper.model_init(config.model_name)
-    model = model_object(n_features=n_features, z_dim=config.latent_space_size)
+    model = model_object(
+        n_features=n_features,
+        z_dim=config.latent_space_size,
+        **data_processing.model_kwargs_from_config(model_object, config),
+    )
     model.to(device)
 
     if config.model_name == "Conv_AE_3D" and hasattr(
@@ -267,6 +271,7 @@ def perform_compression(output_path, config, verbose: bool):
             error_bound_batch,
             error_bound_deltas,
             error_bound_index,
+            compression_metadata,
         ) = helper.compress(
             model_path=os.path.join(output_path, "compressed_output", "encoder.pt"),
             config=config,
@@ -277,6 +282,7 @@ def perform_compression(output_path, config, verbose: bool):
             error_bound_batch,
             error_bound_deltas,
             error_bound_index,
+            compression_metadata,
         ) = helper.compress(
             model_path=os.path.join(output_path, "compressed_output", "model.pt"),
             config=config,
@@ -299,6 +305,9 @@ def perform_compression(output_path, config, verbose: bool):
             data=compressed,
             names=names,
             normalization_features=normalization_features,
+            # Empty for every non-index backend, so the file layout is
+            # unchanged for them.
+            **compression_metadata,
         )
     else:
         if verbose:
@@ -311,6 +320,7 @@ def perform_compression(output_path, config, verbose: bool):
             data=compressed,
             names=names,
             normalization_features=normalization_features,
+            **compression_metadata,
         )
     if config.save_error_bounded_deltas:
         error_bound_batch_index = np.array(

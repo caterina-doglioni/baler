@@ -859,3 +859,451 @@ class TransformerAE(nn.Module):
         z = self.encoder(x)
         x = self.decoder(z)
         return x
+
+
+class VectorQuantizer(nn.Module):
+    """Vector-quantization bottleneck (van den Oord, Vinyals & Kavukcuoglu,
+    "Neural Discrete Representation Learning", NeurIPS 2017, arXiv:1711.00937).
+
+    Maps each continuous encoder output z_e(x) to its nearest entry in a
+    learned codebook of `num_embeddings` vectors, each of `embedding_dim`
+    dimensions. Equation 3 of the paper gives the two bottleneck loss terms
+    returned here (the reconstruction term is supplied by the caller):
+
+        ||sg[z_e(x)] - e||^2  +  beta * ||z_e(x) - sg[e]||^2
+        \\______________/         \\___________________/
+          codebook loss              commitment loss
+
+    where sg[.] is the stop-gradient operator. The codebook loss moves the
+    selected codebook entries towards the encoder output; the commitment loss
+    keeps the encoder from growing its output arbitrarily to escape the
+    codebook. The paper reports results are stable for beta in 0.1-2.0 and
+    uses beta = 0.25 throughout, which is the default here.
+
+    argmin is not differentiable, so gradients are passed from the decoder
+    input back to the encoder output unchanged via the straight-through
+    estimator (section 3.2 of the paper): z_q = z_e + (z_q - z_e).detach()
+    is numerically equal to z_q in the forward pass, while d(z_q)/d(z_e) = 1
+    in the backward pass.
+
+    **Product quantization (`num_groups`).** With num_groups = M the latent is
+    split into M contiguous sub-vectors of embedding_dim/M dims, each quantized
+    against its own codebook, giving M indices per row. This is the lever that
+    sets the bit rate:
+
+        bits/row = M * log2(K)
+
+    K is only a logarithmic lever and the codebook grows linearly in K, so M is
+    how the compression ratio is actually tuned. M = 1 reproduces the original
+    whole-vector behaviour, which on a 1-D tabular latent is an extremely tight
+    bottleneck (one symbol for the entire row).
+
+    **EMA codebook updates (`use_ema`).** Appendix A.1 of the paper replaces the
+    codebook loss term with an exponential moving average of the encoder outputs
+    assigned to each entry, which is generally more robust against codebook
+    collapse. When enabled the codebook receives no gradient and the returned
+    loss is the commitment term only.
+
+    **Dead-entry restarts (`restart_dead`).** Entries unused for
+    `restart_after` consecutive training calls are re-seeded from encoder
+    outputs in the current batch. This complements EMA: an entry that is never
+    selected is never updated by either rule, so it would otherwise stay dead
+    permanently.
+
+    Args:
+        num_embeddings (int): codebook size K.
+        embedding_dim (int): full latent width D. Must be divisible by
+            num_groups.
+        commitment_cost (float): beta in the equation above.
+        num_groups (int): M, number of codes stored per row.
+        use_ema (bool): use EMA codebook updates instead of the codebook loss.
+        ema_decay (float): EMA decay (the paper uses 0.99).
+        ema_epsilon (float): Laplace smoothing for the EMA cluster counts.
+        restart_dead (bool): enable dead-entry restarts.
+        restart_after (int): calls an entry may go unused before restarting.
+    """
+
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        commitment_cost=0.25,
+        num_groups=1,
+        use_ema=False,
+        ema_decay=0.99,
+        ema_epsilon=1e-5,
+        restart_dead=False,
+        restart_after=50,
+    ):
+        super(VectorQuantizer, self).__init__()
+        if embedding_dim % num_groups != 0:
+            divisors = [
+                d for d in range(1, embedding_dim + 1) if embedding_dim % d == 0
+            ]
+            raise ValueError(
+                f"num_groups={num_groups} does not divide embedding_dim="
+                f"{embedding_dim}. Valid num_groups for this latent width: "
+                f"{divisors}. The latent width follows from the config's "
+                f"compression_ratio, so changing that changes the options."
+            )
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+        self.num_groups = num_groups
+        self.sub_dim = embedding_dim // num_groups
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
+        self.ema_epsilon = ema_epsilon
+        self.restart_dead = restart_dead
+        self.restart_after = restart_after
+
+        # One codebook per group: (M, K, sub_dim). float64 to match baler's
+        # data_dimension == 1 path, which feeds the model float64 tensors.
+        codebook = torch.empty(
+            num_groups, num_embeddings, self.sub_dim, dtype=torch.float64
+        )
+        # Uniform over 1/K, as in the reference implementation.
+        codebook.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
+        self.codebook = nn.Parameter(codebook)
+
+        if use_ema:
+            # EMA updates the codebook in place; no gradient should reach it.
+            self.codebook.requires_grad_(False)
+            # cluster_size starts at ONE, not zero, so that the implied
+            # codebook (ema_w / cluster_size) equals the initial codebook. With
+            # a zero start, an entry that is never selected divides a decaying
+            # ema_w by a near-zero count and diverges instead of standing
+            # still -- observed as an unused entry running off to ~2e4.
+            self.register_buffer(
+                "ema_cluster_size",
+                torch.ones(num_groups, num_embeddings, dtype=torch.float64),
+            )
+            self.register_buffer("ema_w", self.codebook.data.clone())
+        if restart_dead:
+            self.register_buffer(
+                "steps_unused",
+                torch.zeros(num_groups, num_embeddings, dtype=torch.long),
+            )
+
+    def _split(self, z_e):
+        """(N, D) -> (M, N, sub_dim)."""
+        n = z_e.shape[0]
+        return z_e.view(n, self.num_groups, self.sub_dim).permute(1, 0, 2)
+
+    def _merge(self, z_g):
+        """(M, N, sub_dim) -> (N, D)."""
+        n = z_g.shape[1]
+        return z_g.permute(1, 0, 2).reshape(n, self.embedding_dim)
+
+    def lookup(self, indices):
+        """Codebook vectors for stored indices, without running the encoder.
+
+        This is what an index-based decompression path needs: the stored
+        integers are all that is required to rebuild the quantized latent.
+
+        Args:
+            indices (torch.Tensor): shape (N, M), dtype long.
+
+        Returns:
+            torch.Tensor: (N, D) reassembled quantized latent.
+        """
+        if indices.dim() == 1:
+            indices = indices.unsqueeze(1)
+        idx_g = indices.t()
+        g = torch.arange(self.num_groups, device=idx_g.device).unsqueeze(1)
+        return self._merge(self.codebook[g, idx_g])
+
+    def forward(self, z_e):
+        """Quantize a batch of encoder outputs.
+
+        Args:
+            z_e (torch.Tensor): continuous encoder output, shape (N, D).
+
+        Returns:
+            tuple: (z_q, loss, indices) with z_q of shape (N, D) carrying the
+                straight-through estimator, loss a scalar, and indices of shape
+                (N, M), dtype long.
+        """
+        z_g = self._split(z_e)
+        # Squared euclidean distance ||z - e||^2 expanded as
+        # ||z||^2 - 2 z.e^T + ||e||^2, batched over groups, so no
+        # (M, N, K, sub) difference tensor is ever materialised.
+        d = (
+            z_g.pow(2).sum(dim=-1, keepdim=True)
+            - 2 * torch.bmm(z_g, self.codebook.transpose(1, 2))
+            + self.codebook.pow(2).sum(dim=-1).unsqueeze(1)
+        )
+        idx_g = d.argmin(dim=-1)  # (M, N)
+        g = torch.arange(self.num_groups, device=z_e.device).unsqueeze(1)
+        q_g = self.codebook[g, idx_g]  # (M, N, sub)
+        z_q = self._merge(q_g)
+
+        if self.use_ema:
+            if self.training:
+                self._ema_update(z_g, idx_g)
+            # Appendix A.1: the codebook is maintained by EMA, so the codebook
+            # loss term disappears and only the commitment term remains.
+            loss = self.commitment_cost * F.mse_loss(z_e, z_q.detach())
+        else:
+            # Equation 3. mse_loss averages, which rescales both terms
+            # identically, so beta keeps its meaning.
+            codebook_loss = F.mse_loss(z_q, z_e.detach())
+            commitment_loss = F.mse_loss(z_e, z_q.detach())
+            loss = codebook_loss + self.commitment_cost * commitment_loss
+
+        if self.restart_dead and self.training:
+            self._restart_dead_entries(z_g, idx_g)
+
+        # Straight-through estimator: identical to z_q numerically, but routes
+        # the decoder's gradient straight back to the encoder.
+        z_q = z_e + (z_q - z_e).detach()
+        return z_q, loss, idx_g.t().contiguous()
+
+    @torch.no_grad()
+    def _ema_update(self, z_g, idx_g):
+        """EMA codebook update, appendix A.1 of arXiv:1711.00937."""
+        k = self.num_embeddings
+        onehot = F.one_hot(idx_g, k).to(self.codebook.dtype)  # (M, N, K)
+        counts = onehot.sum(dim=1)  # (M, K)
+        dw = torch.bmm(onehot.transpose(1, 2), z_g)  # (M, K, sub)
+
+        self.ema_cluster_size.mul_(self.ema_decay).add_(
+            counts, alpha=1 - self.ema_decay
+        )
+        self.ema_w.mul_(self.ema_decay).add_(dw, alpha=1 - self.ema_decay)
+
+        # Laplace smoothing so a zero-count entry does not divide by zero,
+        # while preserving the total mass per group.
+        n = self.ema_cluster_size.sum(dim=1, keepdim=True)
+        smoothed = (
+            (self.ema_cluster_size + self.ema_epsilon) / (n + k * self.ema_epsilon) * n
+        )
+        self.codebook.data.copy_(self.ema_w / smoothed.unsqueeze(-1))
+
+    @torch.no_grad()
+    def _restart_dead_entries(self, z_g, idx_g):
+        """Re-seed entries unused for `restart_after` calls from this batch.
+
+        An entry that is never selected is never updated by either the codebook
+        loss or the EMA, so without this it stays dead permanently.
+        """
+        used = torch.zeros_like(self.steps_unused, dtype=torch.bool)
+        used.scatter_(1, idx_g, True)
+        self.steps_unused.add_(1)
+        self.steps_unused[used] = 0
+
+        dead = self.steps_unused > self.restart_after
+        if not bool(dead.any()):
+            return
+        n = z_g.shape[1]
+        for m in range(self.num_groups):
+            dm = dead[m]
+            n_dead = int(dm.sum())
+            if n_dead == 0:
+                continue
+            pick = torch.randint(0, n, (n_dead,), device=z_g.device)
+            self.codebook.data[m, dm] = z_g[m, pick]
+            if self.use_ema:
+                self.ema_w[m, dm] = z_g[m, pick]
+                self.ema_cluster_size[m, dm] = 1.0
+            self.steps_unused[m, dm] = 0
+
+    def perplexity(self, indices):
+        """Codebook perplexity exp(-sum_k p_k log p_k), averaged over groups.
+
+        Equals the number of distinct entries under uniform use and collapses
+        towards 1 when the model routes everything to a few entries (the
+        characteristic VQ-VAE failure mode). Bounded by 1 <= perplexity <= K.
+
+        Args:
+            indices (torch.Tensor): (N,) or (N, M) selected entries.
+
+        Returns:
+            torch.Tensor: scalar perplexity.
+        """
+        if indices.dim() == 1:
+            indices = indices.unsqueeze(1)
+        onehot = F.one_hot(indices, self.num_embeddings).to(self.codebook.dtype)
+        probs = onehot.mean(dim=0)  # (M, K)
+        # Guard log(0) for unused entries; they contribute 0 to the entropy.
+        per_group = torch.exp(-(probs * torch.log(probs + 1e-12)).sum(dim=-1))
+        return per_group.mean()
+
+    def utilisation(self, indices):
+        """Fraction of entries used at least once, averaged over groups."""
+        if indices.dim() == 1:
+            indices = indices.unsqueeze(1)
+        onehot = F.one_hot(indices, self.num_embeddings)
+        used = (onehot.sum(dim=0) > 0).to(self.codebook.dtype)  # (M, K)
+        return used.mean()
+
+
+class VQVAE(nn.Module):
+    """Vector-Quantized autoencoder backend (arXiv:1711.00937).
+
+    Same dense encoder/decoder topology as `AE` so that the comparison between
+    the two backends isolates the bottleneck: the only difference is that the
+    latent is snapped to a learned codebook before decoding.
+
+        n_features -> 200 -> 100 -> 50 -> z_dim  -[quantize]->  z_dim -> 50 -> 100 -> 200 -> n_features
+
+    `encode` returns the *quantized* latent, so the existing
+    `helper.compress` / `helper.decompress` plumbing works unchanged. Note that
+    this stores the continuous codebook vector (z_dim float64 values per row),
+    not the integer codebook index -- see `encode_indices` for the discrete
+    representation, which is what an entropy-coding compression backend would
+    actually store.
+
+    The quantization loss from the last forward pass is exposed as `self.vq_loss`
+    for `training.fit` / `training.validate` to add to the reconstruction loss.
+
+    Args:
+        n_features (int): input/output width.
+        z_dim (int): latent width, set by baler from the compression ratio.
+        num_embeddings (int): codebook size K. Config: `vq_num_embeddings`.
+        commitment_cost (float): beta. Config: `vq_commitment_cost`.
+        num_groups (int): M, codes stored per row (product quantization).
+            Must divide z_dim. Config: `vq_num_groups`.
+        use_ema (bool): EMA codebook updates. Config: `vq_use_ema`.
+        restart_dead (bool): dead-entry restarts. Config: `vq_restart_dead`.
+    """
+
+    def __init__(
+        self,
+        n_features,
+        z_dim,
+        num_embeddings=512,
+        commitment_cost=0.25,
+        num_groups=1,
+        use_ema=False,
+        restart_dead=False,
+        *args,
+        **kwargs,
+    ):
+        super(VQVAE, self).__init__(*args, **kwargs)
+
+        self.activations = {}
+
+        # encoder
+        self.en1 = nn.Linear(n_features, 200, dtype=torch.float64)
+        self.en2 = nn.Linear(200, 100, dtype=torch.float64)
+        self.en3 = nn.Linear(100, 50, dtype=torch.float64)
+        self.en4 = nn.Linear(50, z_dim, dtype=torch.float64)
+
+        # Quantizer is registered BEFORE the decoder on purpose. helper.decompress
+        # infers the reconstructed width from the LAST entry of the state dict:
+        #     number_of_columns = len(model_dict[list(model_dict.keys())[-1]])
+        # so the final registered parameter must stay the output-layer bias
+        # (length n_features). Registering the codebook after the decoder would
+        # make that read the embedding weight instead (length num_embeddings)
+        # and silently build a wrongly-shaped model at decompression time.
+        # tests/test_models_vqvae.py pins this ordering.
+        self.quantizer = VectorQuantizer(
+            num_embeddings,
+            z_dim,
+            commitment_cost,
+            num_groups=num_groups,
+            use_ema=use_ema,
+            restart_dead=restart_dead,
+        )
+
+        # decoder
+        self.de1 = nn.Linear(z_dim, 50, dtype=torch.float64)
+        self.de2 = nn.Linear(50, 100, dtype=torch.float64)
+        self.de3 = nn.Linear(100, 200, dtype=torch.float64)
+        self.de4 = nn.Linear(200, n_features, dtype=torch.float64)
+
+        self.n_features = n_features
+        self.z_dim = z_dim
+
+        # Populated on every forward/encode; read by training.fit and
+        # training.validate. A zero default keeps the attribute present (and
+        # the hasattr check meaningful) before the first forward pass.
+        self.vq_loss = torch.zeros((), dtype=torch.float64)
+        self.last_indices = None
+
+    def encode_continuous(self, x):
+        """Encoder output before quantization, shape (N, z_dim)."""
+        h1 = F.leaky_relu(self.en1(x))
+        h2 = F.leaky_relu(self.en2(h1))
+        h3 = F.leaky_relu(self.en3(h2))
+        return self.en4(h3)
+
+    def encode(self, x):
+        """Quantized latent, shape (N, z_dim).
+
+        Matches `AE.encode`'s contract so helper.compress needs no changes.
+        Side effect: refreshes `self.vq_loss` and `self.last_indices`.
+        """
+        z_e = self.encode_continuous(x)
+        z_q, loss, indices = self.quantizer(z_e)
+        self.vq_loss = loss
+        self.last_indices = indices
+        return z_q
+
+    def encode_indices(self, x):
+        """Discrete codebook indices for a batch, shape (N, M), dtype long.
+
+        This is the representation that makes VQ-VAE interesting for
+        compression: M * log2(K) bits per row instead of z_dim float64 values.
+        Used by `helper.compress` when the config sets `vq_store_indices`.
+        """
+        z_e = self.encode_continuous(x)
+        _, _, indices = self.quantizer(z_e)
+        return indices
+
+    def decode_indices(self, indices):
+        """Reconstruct from stored codebook indices alone.
+
+        The counterpart to `encode_indices`: an index-based decompression path
+        never sees the encoder, only the saved integers and the codebook.
+
+        Args:
+            indices (torch.Tensor): (N, M) long.
+
+        Returns:
+            torch.Tensor: (N, n_features) reconstruction.
+        """
+        return self.decode(self.quantizer.lookup(indices))
+
+    def decode(self, z):
+        h4 = F.leaky_relu(self.de1(z))
+        h5 = F.leaky_relu(self.de2(h4))
+        h6 = F.leaky_relu(self.de3(h5))
+        out = self.de4(h6)
+        return out
+
+    def forward(self, x):
+        z = self.encode(x)
+        return self.decode(z)
+
+    def codebook_perplexity(self, x):
+        """Codebook perplexity for a batch of inputs. See VectorQuantizer."""
+        return self.quantizer.perplexity(self.encode_indices(x))
+
+    # Activation extraction, matching AE's interface.
+
+    def get_hook(self, layer_name):
+        def hook(model, input, output):
+            self.activations[layer_name] = output.detach()
+
+        return hook
+
+    def get_layers(self) -> list:
+        return [self.en1, self.en2, self.en3, self.de1, self.de2, self.de3]
+
+    def store_hooks(self) -> list:
+        layers = self.get_layers()
+        hooks = []
+        for i in range(len(layers)):
+            hooks.append(layers[i].register_forward_hook(self.get_hook(str(i))))
+        return hooks
+
+    def get_activations(self) -> dict:
+        for kk in self.activations:
+            self.activations[kk] = F.leaky_relu(self.activations[kk])
+        return self.activations
+
+    def detach_hooks(self, hooks: list) -> None:
+        for hook in hooks:
+            hook.remove()

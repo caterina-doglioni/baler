@@ -569,6 +569,7 @@ def compress(model_path, config):
         model_path=model_path,
         n_features=n_features,
         z_dim=config.latent_space_size,
+        **data_processing.model_kwargs_from_config(model_object, config),
     )
     model.eval()
 
@@ -604,11 +605,27 @@ def compress(model_path, config):
         [],
     )
 
+    # Index mode: store the discrete codebook indices instead of the quantized
+    # vector. This is the whole point of a vector-quantizing backend -- the
+    # vector costs the same bytes as a continuous latent, the index costs
+    # num_groups * ceil(log2(K)) bits. Only engaged when the model actually
+    # exposes indices and the config asks for it, so every other backend is
+    # untouched.
+    store_indices = bool(getattr(config, "vq_store_indices", False)) and hasattr(
+        model, "encode_indices"
+    )
+    compression_metadata = {}
+    if store_indices:
+        print("Storing discrete codebook indices (vq_store_indices=True)")
+
     with torch.no_grad():
         for idx, data_batch in enumerate(tqdm(data_dl)):
             data_batch = data_batch.to(device)
 
-            compressed_output = model.encode(data_batch)
+            if store_indices:
+                compressed_output = model.encode_indices(data_batch)
+            else:
+                compressed_output = model.encode(data_batch)
 
             if config.save_error_bounded_deltas:
                 decoded_output = model.decode(compressed_output)
@@ -637,7 +654,36 @@ def compress(model_path, config):
     if config.save_error_bounded_deltas:
         print("Total Deltas Found - ", deltas_compressed)
 
-    return (compressed, error_bound_batch, error_bound_deltas, error_bound_index)
+    if store_indices:
+        # Narrow to the smallest unsigned type that holds K-1. Without this the
+        # indices would be saved as int64 and the file would be 8x larger than
+        # it needs to be, which would hide the entire benefit.
+        k = model.quantizer.num_embeddings
+        if k <= 2**8:
+            dtype = np.uint8
+        elif k <= 2**16:
+            dtype = np.uint16
+        else:
+            dtype = np.uint32
+        compressed = compressed.astype(dtype)
+        compression_metadata = {
+            "latent_mode": np.array("indices"),
+            "z_dim": np.array(model.quantizer.embedding_dim),
+            "num_groups": np.array(model.quantizer.num_groups),
+            "num_embeddings": np.array(k),
+        }
+        print(
+            f"Stored {compressed.shape[1]} index/row as {np.dtype(dtype).name} "
+            f"({compressed.shape[1] * int(np.ceil(np.log2(k)))} bits/row)"
+        )
+
+    return (
+        compressed,
+        error_bound_batch,
+        error_bound_deltas,
+        error_bound_index,
+        compression_metadata,
+    )
 
 
 def decompress(
@@ -689,7 +735,25 @@ def decompress(
         deltas_added = 0
 
     model_name = config.model_name
-    latent_space_size = len(data[0])
+
+    # Index mode is self-describing: compressed.npz carries the latent width,
+    # group count and codebook size, because in that mode the array's own width
+    # is num_groups (the number of stored indices), NOT the latent width, so
+    # the usual len(data[0]) inference below would build a wrongly sized model.
+    index_mode = "latent_mode" in loaded and str(loaded["latent_mode"]) == "indices"
+    index_kwargs = {}
+    if index_mode:
+        latent_space_size = int(loaded["z_dim"])
+        index_kwargs = {
+            "num_groups": int(loaded["num_groups"]),
+            "num_embeddings": int(loaded["num_embeddings"]),
+        }
+        print(
+            f"Decompressing from stored indices: {data.shape[1]} index/row, "
+            f"K={index_kwargs['num_embeddings']}, latent width {latent_space_size}"
+        )
+    else:
+        latent_space_size = len(data[0])
     bs = config.batch_size
     model_dict = torch.load(
         str(model_path), map_location=get_device(), weights_only=True
@@ -702,19 +766,30 @@ def decompress(
     # Initialise and load the model correctly.
     device = get_device()
     model_object = data_processing.initialise_model(model_name)
+    # Metadata saved alongside the indices wins over the config: it describes
+    # the model that actually produced this file, and the codebook is a saved
+    # parameter, so a mismatch in K or num_groups would fail to load.
+    model_kwargs = data_processing.model_kwargs_from_config(model_object, config)
+    model_kwargs.update(index_kwargs)
     model = data_processing.load_model(
         model_object,
         model_path=model_path,
         n_features=number_of_columns,
         z_dim=latent_space_size,
+        **model_kwargs,
     )
     model.eval()
 
     if config.model_type == "convolutional":
         model.set_final_layer_dims(final_layer_details)
 
-    # Load the data, convert to tensor and batch it to avoid memory leaks
-    data_tensor = torch.from_numpy(data).to(device)
+    # Load the data, convert to tensor and batch it to avoid memory leaks.
+    # Index arrays are stored as uint8/uint16, which torch does not accept, so
+    # widen to int64 first.
+    if index_mode:
+        data_tensor = torch.from_numpy(data.astype(np.int64)).to(device)
+    else:
+        data_tensor = torch.from_numpy(data).to(device)
     data_dl = DataLoader(
         data_tensor,
         batch_size=bs,
@@ -728,7 +803,10 @@ def decompress(
         for idx, data_batch in enumerate(tqdm(data_dl)):
             data_batch = data_batch.to(device)
 
-            out = model.decode(data_batch).to(device)
+            if index_mode:
+                out = model.decode_indices(data_batch).to(device)
+            else:
+                out = model.decode(data_batch).to(device)
             # Converting back to numpyarray
             out = detacher(out)
             if config.save_error_bounded_deltas:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from typing import List, Tuple
 
 import numpy as np
@@ -86,7 +87,47 @@ def initialise_model(model_name: str):
     return model_object
 
 
-def load_model(model_object, model_path: str, n_features: int, z_dim: int):
+def model_kwargs_from_config(model_object, config) -> dict:
+    """Optional, model-specific constructor arguments drawn from the project config.
+
+    Only options the config actually defines AND the model's constructor
+    actually accepts are returned, so backends that take no extra arguments
+    (AE, Conv_AE, ...) keep being constructed exactly as before even if a
+    config happens to define these keys.
+
+    Currently consumed by `models.VQVAE`:
+        config.vq_num_embeddings  -> num_embeddings  (codebook size K)
+        config.vq_commitment_cost -> commitment_cost (beta)
+
+    These must be applied identically when training and when rebuilding the
+    model to compress/decompress: the codebook is a parameter in the saved
+    state dict, so a mismatch in K would not load.
+
+    Args:
+        model_object (type): the model class, as returned by `initialise_model`.
+        config (dataClass): base class selecting user inputs.
+
+    Returns:
+        dict: keyword arguments to pass to the model constructor.
+    """
+    candidates = {
+        "num_embeddings": "vq_num_embeddings",
+        "commitment_cost": "vq_commitment_cost",
+        "num_groups": "vq_num_groups",
+        "use_ema": "vq_use_ema",
+        "restart_dead": "vq_restart_dead",
+    }
+    accepted = inspect.signature(model_object).parameters
+    return {
+        arg: getattr(config, config_key)
+        for arg, config_key in candidates.items()
+        if arg in accepted and hasattr(config, config_key)
+    }
+
+
+def load_model(
+    model_object, model_path: str, n_features: int, z_dim: int, **model_kwargs
+):
     """Loads the state dictionary of the trained model into a model variable. This variable is then used for passing
     data through the encoding and decoding functions.
 
@@ -95,12 +136,15 @@ def load_model(model_object, model_path: str, n_features: int, z_dim: int):
         model_path (str): Path to model
         n_features (int): Input dimension size
         z_dim (int): Latent space size
+        **model_kwargs: Extra model-specific constructor arguments, e.g. from
+            `model_kwargs_from_config`. Must match what was used at training
+            time or the state dict will not load.
 
     Returns: nn.Module: Returns a model object with the attributes of the model class, with the selected state
     dictionary loaded into it.
     """
     device = helper.get_device()
-    model = model_object(n_features, z_dim)
+    model = model_object(n_features, z_dim, **model_kwargs)
     model.to(device)
 
     # Loading the state_dict into the model

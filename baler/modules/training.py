@@ -88,6 +88,14 @@ def fit(
                 validate=True,
             )
 
+            # Quantizing backends (models.VQVAE) carry a bottleneck loss that
+            # the reconstruction term above cannot see: the codebook and
+            # commitment terms of eq. 3 in arXiv:1711.00937. Add it rather
+            # than replacing the loss, so every non-quantizing backend keeps
+            # exactly the loss it had before this hook existed.
+            if getattr(model, "vq_loss", None) is not None:
+                loss = loss + model.vq_loss
+
         # Compute the loss-gradient with
         loss.backward()
 
@@ -130,6 +138,13 @@ def validate(model, test_dl, model_children, reg_param):
                 reg_param=reg_param,
                 validate=True,
             )
+
+            # Same bottleneck term as in fit(), so the validation curve is
+            # measuring the same quantity the optimizer is minimising. See the
+            # comment there.
+            if getattr(model, "vq_loss", None) is not None:
+                loss = loss + model.vq_loss
+
             running_loss += loss.item()
 
     epoch_loss = running_loss / (idx + 1)
